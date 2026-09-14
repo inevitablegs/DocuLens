@@ -3,15 +3,15 @@ DocuLens AI — API routes
 """
 import asyncio
 import json
+import logging
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
-from fastapi.responses import FileResponse, StreamingResponse
-from sqlalchemy import select
+from fastapi.responses import FileResponse, StreamingResponse, Response
+from sqlalchemy import select, delete
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm import selectinload
 
-from backend.database.db import get_session
+from backend.database.db import get_session, async_session
 from backend.database.models import (
     Document, Page, Block, Entity, TableExtraction,
     Insight, TimelineEvent, Correction, ProcessingJob,
@@ -25,6 +25,7 @@ from backend.models.schemas import (
     BBox, EvidenceRef, ProcessingStageOut, DocumentFullOut,
 )
 
+logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api")
 
 
@@ -140,7 +141,7 @@ async def upload_document(
             "message": "Cached result found — retrieved instantly",
         }
 
-    # Start async processing pipeline
+    # Start async processing pipeline in background
     asyncio.create_task(_run_pipeline_bg(doc.id))
 
     return {
@@ -151,13 +152,12 @@ async def upload_document(
 
 
 async def _run_pipeline_bg(doc_id: str):
-    """Run the pipeline in a background task with its own session."""
-    from backend.database.db import async_session
+    """Run the pipeline in a background task with its own dedicated session."""
     async with async_session() as session:
         try:
             await run_pipeline(doc_id, session)
         except Exception as e:
-            print(f"Pipeline error for {doc_id}: {e}")
+            logger.error(f"Pipeline background error for {doc_id}: {e}")
 
 
 # ─── List Documents ──────────────────────────────────────
@@ -233,7 +233,7 @@ async def get_document(doc_id: str, session: AsyncSession = Depends(get_session)
             ) for b in blocks],
         ))
 
-    review_items = [_entity_out(e) for e in entities if e.confidence and e.confidence < CONFIDENCE_THRESHOLD]
+    review_items = [_entity_out(e) for e in entities if e.confidence is not None and e.confidence < CONFIDENCE_THRESHOLD]
 
     return DocumentFullOut(
         document=_doc_out(doc),
@@ -252,17 +252,39 @@ async def get_document(doc_id: str, session: AsyncSession = Depends(get_session)
 # ─── SSE Stream ──────────────────────────────────────────
 @router.get("/documents/{doc_id}/stream")
 async def stream_processing(doc_id: str):
-    """Server-Sent Events stream for real-time processing updates."""
+    """Server-Sent Events stream with database fallback to prevent indefinite waiting."""
     async def event_generator():
         last_index = 0
+        iteration = 0
         while True:
             events = get_events(doc_id)
             new_events = events[last_index:]
             for event in new_events:
                 yield f"data: {json.dumps(event)}\n\n"
                 last_index += 1
-                if event.get("stage") == "complete" or event.get("stage") == "error":
+                if event.get("stage") in ("complete", "error") or event.get("status") in ("completed", "failed"):
                     return
+
+            iteration += 1
+
+            # Check database state periodically or if event list is empty
+            if iteration % 4 == 0 or (iteration == 1 and not events):
+                async with async_session() as s:
+                    doc = await s.get(Document, doc_id)
+                    if doc and doc.status in ("completed", "failed"):
+                        terminal_stage = "complete" if doc.status == "completed" else "error"
+                        yield f"data: {json.dumps({'stage': terminal_stage, 'status': doc.status, 'progress': 100, 'message': f'Document {doc.status}'})}\n\n"
+                        return
+
+            # Keep-alive heartbeat comment every 5 seconds
+            if iteration % 10 == 0:
+                yield ": ping\n\n"
+
+            # Maximum timeout ~ 120 seconds
+            if iteration > 240:
+                yield f"data: {json.dumps({'stage': 'error', 'status': 'failed', 'progress': 0, 'message': 'Processing stream timed out'})}\n\n"
+                return
+
             await asyncio.sleep(0.5)
 
     return StreamingResponse(
@@ -278,15 +300,25 @@ async def stream_processing(doc_id: str):
 
 # ─── Page Images ─────────────────────────────────────────
 @router.get("/documents/{doc_id}/pages/{page_num}/image")
-async def get_page_image(doc_id: str, page_num: int):
-    """Serve a rendered page image."""
+async def get_page_image(doc_id: str, page_num: int, session: AsyncSession = Depends(get_session)):
+    """Serve a rendered page image, generating a clean text preview if not on disk."""
     pages_dir = DOCUMENTS_DIR / doc_id / "pages"
     for fmt in ("png", "jpg", "jpeg"):
         img_path = pages_dir / f"page_{page_num:03d}.{fmt}"
         if img_path.exists():
             mime = {"png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg"}[fmt]
             return FileResponse(str(img_path), media_type=mime)
-    raise HTTPException(404, "Page image not found")
+
+    # If image does not exist, fetch page text from database and synthesize preview
+    p_res = await session.execute(
+        select(Page).where(Page.document_id == doc_id, Page.page_number == page_num)
+    )
+    page_rec = p_res.scalars().first()
+    text = page_rec.text if page_rec and page_rec.text else f"Page {page_num}"
+
+    from backend.ocr.service import _generate_text_canvas_image
+    fallback_bytes = _generate_text_canvas_image(text, page_num=page_num)
+    return Response(content=fallback_bytes, media_type="image/png")
 
 
 # ─── Serve original document ─────────────────────────────
@@ -330,6 +362,72 @@ async def correct_entity(
     await session.commit()
 
     return {"entity": _entity_out(entity).model_dump(), "corrected": True}
+
+
+# ─── Reprocess Document ──────────────────────────────────
+@router.post("/documents/{doc_id}/reprocess")
+async def reprocess_document(
+    doc_id: str,
+    session: AsyncSession = Depends(get_session),
+):
+    """Reprocess a failed or incomplete document from scratch."""
+    doc = await session.get(Document, doc_id)
+    if not doc:
+        raise HTTPException(404, "Document not found")
+
+    # Clean existing extracted records
+    await session.execute(delete(Entity).where(Entity.document_id == doc_id))
+    await session.execute(delete(TableExtraction).where(TableExtraction.document_id == doc_id))
+    await session.execute(delete(Insight).where(Insight.document_id == doc_id))
+    await session.execute(delete(TimelineEvent).where(TimelineEvent.document_id == doc_id))
+    
+    # Clean blocks and pages
+    page_ids_q = await session.execute(select(Page.id).where(Page.document_id == doc_id))
+    page_ids = page_ids_q.scalars().all()
+    if page_ids:
+        await session.execute(delete(Block).where(Block.page_id.in_(page_ids)))
+    await session.execute(delete(Page).where(Page.document_id == doc_id))
+    await session.execute(delete(ProcessingJob).where(ProcessingJob.document_id == doc_id))
+
+    doc.status = "processing"
+    doc.overall_confidence = None
+    doc.document_type = None
+    await session.commit()
+
+    # Clear page images directory
+    pages_dir = DOCUMENTS_DIR / doc_id / "pages"
+    if pages_dir.exists():
+        import shutil
+        shutil.rmtree(pages_dir, ignore_errors=True)
+    pages_dir.mkdir(parents=True, exist_ok=True)
+
+    # Re-launch pipeline
+    asyncio.create_task(_run_pipeline_bg(doc_id))
+
+    return {
+        "document": _doc_out(doc).model_dump(),
+        "message": "Reprocessing started",
+    }
+
+
+# ─── Delete Document ─────────────────────────────────────
+@router.delete("/documents/{doc_id}")
+async def delete_document(
+    doc_id: str,
+    session: AsyncSession = Depends(get_session),
+):
+    """Delete a document and its stored files."""
+    doc = await session.get(Document, doc_id)
+    if not doc:
+        raise HTTPException(404, "Document not found")
+
+    from backend.storage.file_store import delete_document_files
+    delete_document_files(doc_id)
+
+    await session.delete(doc)
+    await session.commit()
+
+    return {"message": "Document deleted successfully", "id": doc_id}
 
 
 # ─── Review Queue ────────────────────────────────────────

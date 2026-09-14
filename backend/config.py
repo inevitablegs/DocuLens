@@ -3,6 +3,12 @@ DocuLens AI — Configuration
 """
 import os
 from pathlib import Path
+from dotenv import load_dotenv
+
+# Load .env if present
+load_dotenv()
+load_dotenv(Path(__file__).resolve().parent.parent / ".env")
+load_dotenv(Path(__file__).resolve().parent / ".env")
 
 # ─── Paths ───────────────────────────────────────────────
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -20,8 +26,8 @@ for d in [DOCUMENTS_DIR, PAGES_DIR, CACHE_DIR]:
 DATABASE_URL = f"sqlite+aiosqlite:///{DB_PATH}"
 
 # ─── Gemini ──────────────────────────────────────────────
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
-GEMINI_MODEL = "gemini-2.0-flash"
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "AIzaSyAnKClHlLkbBvebJoLaieCH0xSvQQWjN8Y")
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
 
 # ─── Processing ──────────────────────────────────────────
 MAX_FILE_SIZE_MB = 50

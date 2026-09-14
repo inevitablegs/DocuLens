@@ -212,24 +212,28 @@ def test_api_upload_and_list():
 
 def test_hitl_correction_endpoint():
     """Test Human-in-the-loop correction and confidence bump."""
+    import uuid
     client = TestClient(app)
     from backend.database.db import async_session
     from backend.database.models import Document, Entity
 
+    test_doc_id = f"doc-hitl-{uuid.uuid4().hex[:8]}"
+    test_ent_id = f"ent-hitl-{uuid.uuid4().hex[:8]}"
+
     async def _setup_entity():
         async with async_session() as session:
             doc = Document(
-                id="doc-test-hitl",
+                id=test_doc_id,
                 filename="hitl_doc.pdf",
-                file_hash="hash-hitl-123",
+                file_hash=f"hash-{uuid.uuid4().hex[:8]}",
                 file_size=1024,
                 mime_type="application/pdf",
                 status="completed",
             )
             session.add(doc)
             entity = Entity(
-                id="ent-test-1",
-                document_id="doc-test-hitl",
+                id=test_ent_id,
+                document_id=test_doc_id,
                 entity_type="TOTAL_AMOUNT",
                 value="$450.00",
                 confidence=0.62,
@@ -242,7 +246,7 @@ def test_hitl_correction_endpoint():
 
     # Send human correction
     patch_res = client.patch(
-        "/api/entities/ent-test-1",
+        f"/api/entities/{test_ent_id}",
         json={"value": "$500.00", "verified": True},
     )
     assert patch_res.status_code == 200
@@ -251,3 +255,53 @@ def test_hitl_correction_endpoint():
     assert data["entity"]["value"] == "$500.00"
     assert data["entity"]["confidence"] == 1.0  # Human-verified = 100% confidence
     assert data["entity"]["verified"] is True
+
+
+def test_safe_parse_json():
+    """Test resilient JSON parsing against markdown code fences and messy text."""
+    from backend.gemini_client import safe_parse_json
+
+    # Test clean JSON
+    assert safe_parse_json('{"key": "value"}') == {"key": "value"}
+
+    # Test markdown code block
+    fenced = '```json\n{"document_type": "invoice", "confidence": 0.95}\n```'
+    parsed = safe_parse_json(fenced)
+    assert parsed["document_type"] == "invoice"
+    assert parsed["confidence"] == 0.95
+
+    # Test extra surrounding commentary
+    messy = 'Here is the output:\n```\n{"items": [1, 2, 3]}\n```\nThanks!'
+    assert safe_parse_json(messy) == {"items": [1, 2, 3]}
+
+    # Test trailing comma
+    trailing = '{"a": 1, "b": 2,}'
+    assert safe_parse_json(trailing) == {"a": 1, "b": 2}
+
+    # Test invalid input fallback
+    assert safe_parse_json("Not a json at all", default={"fallback": True}) == {"fallback": True}
+    assert safe_parse_json(None, default={}) == {}
+
+
+def test_mock_pdf_resilience():
+    """Test that mock/plain-text PDFs do not crash OCR extraction."""
+    import tempfile
+    from backend.ocr.service import extract_from_digital_pdf, extract_from_scanned_pdf
+
+    with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tf:
+        tf.write(b"%PDF-1.4\nINVOICE INV-9901\nTotal: $300.00\nDate: 2026-05-10\n")
+        temp_path = Path(tf.name)
+
+    try:
+        res1 = asyncio.run(extract_from_digital_pdf(temp_path, "mock-doc-1"))
+        assert "pages" in res1
+        assert len(res1["pages"]) >= 1
+        assert "INV-9901" in res1["pages"][0]["text"]
+
+        res2 = asyncio.run(extract_from_scanned_pdf(temp_path, "mock-doc-2"))
+        assert "pages" in res2
+        assert len(res2["pages"]) >= 1
+    finally:
+        if temp_path.exists():
+            temp_path.unlink()
+

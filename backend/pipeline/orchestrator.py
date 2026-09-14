@@ -4,6 +4,7 @@ Runs the full document processing pipeline asynchronously and emits SSE events.
 """
 import asyncio
 import json
+import logging
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -30,6 +31,8 @@ from backend.confidence.service import (
     needs_human_review,
 )
 
+logger = logging.getLogger(__name__)
+
 # In-memory event store for SSE streaming (per document)
 _events: dict[str, list[dict]] = {}
 
@@ -45,6 +48,7 @@ def _emit(doc_id: str, stage: str, status: str, progress: int, message: str = ""
         "progress": progress,
         "message": message,
         "document_id": doc_id,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
     }
     if doc_id not in _events:
         _events[doc_id] = []
@@ -62,19 +66,26 @@ async def _save_processing_job(session: AsyncSession, doc_id: str, stage: str, s
     if status == "completed":
         job.completed_at = datetime.now(timezone.utc)
     session.add(job)
-    await session.flush()
+    await session.commit()
 
 
 async def run_pipeline(doc_id: str, session: AsyncSession):
-    """Run the full document processing pipeline."""
+    """Run the full document processing pipeline with stage commits and resilient error handling."""
     _events[doc_id] = []  # Reset events
 
     try:
+        doc = await session.get(Document, doc_id)
+        if not doc:
+            raise ValueError(f"Document {doc_id} not found")
+
+        doc.status = "processing"
+        await session.commit()
+
         # ──── Stage 1: Ingestion ────────────────────────────
         _emit(doc_id, "ingestion", "running", 50, "Validating document...")
         file_path = get_original_path(doc_id)
-        if not file_path:
-            raise Exception("Original file not found")
+        if not file_path or not file_path.exists():
+            raise FileNotFoundError("Original uploaded file not found on disk")
 
         _emit(doc_id, "ingestion", "completed", 100, "Document validated")
         await _save_processing_job(session, doc_id, "ingestion", "completed", 100, "Document validated")
@@ -82,14 +93,14 @@ async def run_pipeline(doc_id: str, session: AsyncSession):
         # ──── Stage 2: Quality Analysis + Routing ───────────
         _emit(doc_id, "routing", "running", 50, "Analyzing document quality...")
         quality = await analyze_document_quality(file_path)
-        page_count = quality.get("page_count", 1)
+        page_count = max(1, quality.get("page_count", 1))
         is_scanned = quality.get("is_scanned", False)
         pipeline_type = quality.get("recommended_pipeline", ["pdf_parser"])[0]
 
         # Update document
-        doc = await session.get(Document, doc_id)
         doc.page_count = page_count
         doc.is_scanned = is_scanned
+        await session.commit()
 
         _emit(doc_id, "routing", "completed", 100,
               f"{'Scanned' if is_scanned else 'Digital'} document · {page_count} pages · Pipeline: {pipeline_type}")
@@ -111,7 +122,19 @@ async def run_pipeline(doc_id: str, session: AsyncSession):
         page_ocr_confidences: list[float] = []
         blocks_by_page: dict[int, list[dict]] = {}
 
-        for p_data in ocr_result.get("pages", []):
+        pages_list = ocr_result.get("pages", [])
+        if not pages_list:
+            # Generate at least one fallback page
+            pages_list = [{
+                "page_number": 1,
+                "width": 800,
+                "height": 1050,
+                "text": "No text could be extracted.",
+                "ocr_confidence": 0.5,
+                "blocks": [],
+            }]
+
+        for p_data in pages_list:
             page_num = p_data["page_number"]
             page_text = p_data.get("text", "")
             page_texts[page_num] = page_text
@@ -123,8 +146,8 @@ async def run_pipeline(doc_id: str, session: AsyncSession):
                 document_id=doc_id,
                 page_number=page_num,
                 image_path=f"/api/documents/{doc_id}/pages/{page_num}/image",
-                width=p_data.get("width"),
-                height=p_data.get("height"),
+                width=p_data.get("width", 800),
+                height=p_data.get("height", 1050),
                 text=page_text,
                 ocr_confidence=ocr_conf,
             )
@@ -152,21 +175,25 @@ async def run_pipeline(doc_id: str, session: AsyncSession):
                     "bbox": [block.bbox_x0, block.bbox_y0, block.bbox_x1, block.bbox_y1],
                 })
 
-            progress = int((page_num / max(len(ocr_result.get("pages", [])), 1)) * 100)
-            _emit(doc_id, "ocr", "running", progress, f"Processed page {page_num}/{page_count}")
+            progress = int((page_num / max(len(pages_list), 1)) * 100)
+            _emit(doc_id, "ocr", "running", progress, f"Processed page {page_num}/{len(pages_list)}")
+
+        doc.page_count = len(pages_list)
+        await session.commit()
 
         _emit(doc_id, "ocr", "completed", 100,
-              f"Text extracted from {len(ocr_result.get('pages', []))} pages via {ocr_result.get('method', 'unknown')}")
+              f"Text extracted from {len(pages_list)} page(s) via {ocr_result.get('method', 'unknown')}")
         await _save_processing_job(session, doc_id, "ocr", "completed", 100, "Text extraction complete")
 
         # ──── Stage 4: Classification ───────────────────────
         _emit(doc_id, "classification", "running", 50, "Classifying document...")
 
-        all_text = " ".join(page_texts.values())
+        all_text = " ".join(page_texts.values()).strip()
         classification = await classify(all_text[:8000])
 
         doc.document_type = classification.get("document_type", "report")
         doc.classification_signals = json.dumps(classification.get("signals", []))
+        await session.commit()
 
         _emit(doc_id, "classification", "completed", 100,
               f"Type: {doc.document_type} · Confidence: {classification.get('confidence', 0):.0%} · Method: {classification.get('method', 'unknown')}")
@@ -179,7 +206,8 @@ async def run_pipeline(doc_id: str, session: AsyncSession):
         try:
             entity_result = await extract_entities(all_text, doc.document_type, page_texts)
             raw_entities = entity_result.get("entities", [])
-        except Exception:
+        except Exception as e:
+            logger.warning(f"Entity extraction error: {e}")
             raw_entities = []
 
         _emit(doc_id, "extraction", "running", 60, f"Found {len(raw_entities)} entities. Extracting tables...")
@@ -188,7 +216,8 @@ async def run_pipeline(doc_id: str, session: AsyncSession):
         try:
             table_result = await extract_tables(all_text, doc.document_type, page_texts)
             raw_tables = table_result.get("tables", [])
-        except Exception:
+        except Exception as e:
+            logger.warning(f"Table extraction error: {e}")
             raw_tables = []
 
         # Save entities with confidence scoring and block/bbox resolution
@@ -262,6 +291,8 @@ async def run_pipeline(doc_id: str, session: AsyncSession):
             )
             session.add(table)
 
+        await session.commit()
+
         _emit(doc_id, "extraction", "completed", 100,
               f"Extracted {len(raw_entities)} entities and {len(raw_tables)} tables")
         await _save_processing_job(session, doc_id, "extraction", "completed", 100,
@@ -273,7 +304,8 @@ async def run_pipeline(doc_id: str, session: AsyncSession):
         try:
             entity_dicts = [{"type": e.get("entity_type"), "value": e.get("value")} for e in raw_entities]
             insights_result = await generate_insights(all_text, doc.document_type, entity_dicts, page_texts)
-        except Exception:
+        except Exception as e:
+            logger.warning(f"Insights generation error: {e}")
             insights_result = {}
 
         # Save timeline events
@@ -307,13 +339,21 @@ async def run_pipeline(doc_id: str, session: AsyncSession):
                 )
                 session.add(insight)
 
+        await session.commit()
+
         _emit(doc_id, "insights", "completed", 100, "Insights generated")
         await _save_processing_job(session, doc_id, "insights", "completed", 100, "Insights generated")
 
         # ──── Stage 7: Verification + Final Confidence ──────
         _emit(doc_id, "verification", "running", 50, "Verifying evidence...")
 
-        doc.overall_confidence = compute_document_confidence(entity_confidences)
+        if entity_confidences:
+            doc.overall_confidence = compute_document_confidence(entity_confidences)
+        elif page_ocr_confidences:
+            doc.overall_confidence = round(sum(page_ocr_confidences) / len(page_ocr_confidences) * 0.9, 4)
+        else:
+            doc.overall_confidence = 0.85
+
         review_count = sum(1 for c in entity_confidences if needs_human_review(c))
 
         _emit(doc_id, "verification", "completed", 100,
@@ -328,12 +368,15 @@ async def run_pipeline(doc_id: str, session: AsyncSession):
         _emit(doc_id, "complete", "completed", 100, "Processing complete!")
 
     except Exception as e:
-        _emit(doc_id, "error", "failed", 0, str(e))
+        logger.exception(f"Pipeline error for {doc_id}: {e}")
+        _emit(doc_id, "error", "failed", 0, f"Processing failed: {str(e)}")
         try:
-            doc = await session.get(Document, doc_id)
-            if doc:
-                doc.status = "failed"
+            await session.rollback()
+            failed_doc = await session.get(Document, doc_id)
+            if failed_doc:
+                failed_doc.status = "failed"
+                await _save_processing_job(session, doc_id, "pipeline", "failed", 0, str(e))
                 await session.commit()
-        except Exception:
-            pass
+        except Exception as inner_e:
+            logger.error(f"Failed to record failure status for {doc_id}: {inner_e}")
         raise

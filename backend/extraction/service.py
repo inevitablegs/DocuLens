@@ -12,7 +12,9 @@ INVOICE_PATTERNS = {
     "INVOICE_NUMBER": [
         r"(?:invoice\s*(?:no|number|#|id)[\s:]*)([A-Z0-9\-_/]+)",
         r"(?:inv[\s#:]+)([A-Z0-9\-_/]+)",
+        r"\b(?:invoice|inv)\s+(?!(?:date|amount|total|due|subtotal|to|for)\b)([A-Z0-9\-_/]{3,30})\b",
     ],
+
     "INVOICE_DATE": [
         r"(?:invoice\s*date[\s:]*)(\d{1,2}[/-]\d{1,2}[/-]\d{2,4}|\w+\s+\d{1,2},?\s+\d{4}|\d{4}-\d{2}-\d{2})",
         r"(?:date[\s:]*)(\d{1,2}[/-]\d{1,2}[/-]\d{2,4}|\w+\s+\d{1,2},?\s+\d{4}|\d{4}-\d{2}-\d{2})",
@@ -22,15 +24,16 @@ INVOICE_PATTERNS = {
         r"(?:payment\s*due[\s:]*)(\d{1,2}[/-]\d{1,2}[/-]\d{2,4}|\w+\s+\d{1,2},?\s+\d{4}|\d{4}-\d{2}-\d{2})",
     ],
     "TOTAL_AMOUNT": [
-        r"(?:total\s*(?:amount|due|balance)?[\s:]*)(?:[$€£₹]\s*|\bUSD\s*|\bEUR\s*)?([0-9,]+\.\d{2})",
-        r"(?:amount\s*due[\s:]*)(?:[$€£₹]\s*)?([0-9,]+\.\d{2})",
-        r"(?:balance\s*due[\s:]*)(?:[$€£₹]\s*)?([0-9,]+\.\d{2})",
+        r"(?:total\s*(?:amount|due|balance)?[\s:]*)(?:[$€£₹]\s*|\bUSD\s*|\bEUR\s*)?([0-9,]+(?:\.\d{1,2})?)",
+        r"(?:amount\s*due[\s:]*)(?:[$€£₹]\s*)?([0-9,]+(?:\.\d{1,2})?)",
+        r"(?:balance\s*due[\s:]*)(?:[$€£₹]\s*)?([0-9,]+(?:\.\d{1,2})?)",
+        r"\b(?:total|balance)[\s:]*\$?\s*([0-9,]+(?:\.\d{1,2})?)\b",
     ],
     "SUBTOTAL": [
-        r"(?:subtotal|sub\s*total|net\s*amount)[\s:]*(?:[$€£₹]\s*)?([0-9,]+\.\d{2})",
+        r"(?:subtotal|sub\s*total|net\s*amount)[\s:]*(?:[$€£₹]\s*)?([0-9,]+(?:\.\d{1,2})?)",
     ],
     "TAX": [
-        r"(?:tax|vat|gst|sales\s*tax)[\s:]*(?:[$€£₹]\s*)?([0-9,]+\.\d{2})",
+        r"(?:tax|vat|gst|sales\s*tax)[\s:]*(?:[$€£₹]\s*)?([0-9,]+(?:\.\d{1,2})?)",
     ],
     "VENDOR": [
         r"(?:from|vendor|billed\s*by|remit\s*to)[\s:]*([A-Za-z0-9\s.,&'-]{3,40})",
@@ -44,6 +47,7 @@ INVOICE_PATTERNS = {
         r"\b(net\s*\d+)\b",
     ],
 }
+
 
 MEDICAL_PATTERNS = {
     "PATIENT_NAME": [
@@ -158,8 +162,12 @@ def extract_entities_rule_based(
                 for m in matches:
                     val = m.group(1).strip()
                     # Clean up trailing punctuation
-                    val = re.sub(r"[\s,:;]+$", "", val)
+                    val = re.sub(r"[\s,:;#]+$", "", val)
                     if not val or len(val) < 2:
+                        continue
+
+                    # Filter out stop-words for invoice numbers
+                    if entity_type == "INVOICE_NUMBER" and val.lower() in ("date", "amount", "total", "subtotal", "due", "to", "for", "bill"):
                         continue
 
                     key = (entity_type, val.lower())

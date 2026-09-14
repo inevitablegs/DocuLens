@@ -1,8 +1,10 @@
 """
-DocuLens AI — Gemini client wrapper with automated fallback
+DocuLens AI — Gemini client wrapper with automated fallback and robust JSON parsing
 """
 import json
 import logging
+import re
+from typing import Any
 from google import genai
 from google.genai import types
 
@@ -26,6 +28,64 @@ def get_client() -> genai.Client | None:
             logger.warning(f"Could not initialize Gemini client: {e}")
             return None
     return _client
+
+
+def safe_parse_json(text: str | None, default: Any = None) -> Any:
+    """
+    Robustly extract and parse JSON from model responses.
+    Handles markdown fences, leading/trailing commentary, and slight syntax deviations.
+    """
+    if not text or not isinstance(text, str):
+        return default if default is not None else {}
+
+    cleaned = text.strip()
+
+    # 1. Direct JSON parse
+    try:
+        return json.loads(cleaned)
+    except Exception:
+        pass
+
+    # 2. Extract from markdown code fence ```json ... ``` or ``` ... ```
+    fence_match = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", cleaned, re.IGNORECASE)
+    if fence_match:
+        inner = fence_match.group(1).strip()
+        try:
+            return json.loads(inner)
+        except Exception:
+            cleaned = inner
+
+    # 3. Find outermost JSON object { ... }
+    first_brace = cleaned.find("{")
+    last_brace = cleaned.rfind("}")
+    if first_brace != -1 and last_brace != -1 and last_brace > first_brace:
+        candidate = cleaned[first_brace:last_brace + 1]
+        try:
+            return json.loads(candidate)
+        except Exception:
+            # Try cleaning trailing commas: e.g. [1, 2,] or {"a": 1,}
+            candidate_no_commas = re.sub(r",\s*([}\]])", r"\1", candidate)
+            try:
+                return json.loads(candidate_no_commas)
+            except Exception:
+                pass
+
+    # 4. Find outermost JSON array [ ... ]
+    first_bracket = cleaned.find("[")
+    last_bracket = cleaned.rfind("]")
+    if first_bracket != -1 and last_bracket != -1 and last_bracket > first_bracket:
+        candidate = cleaned[first_bracket:last_bracket + 1]
+        try:
+            return json.loads(candidate)
+        except Exception:
+            candidate_no_commas = re.sub(r",\s*([}\]])", r"\1", candidate)
+            try:
+                return json.loads(candidate_no_commas)
+            except Exception:
+                pass
+
+    logger.warning(f"safe_parse_json could not parse model response (snippet: {cleaned[:150]}...)")
+    return default if default is not None else {}
 
 
 async def classify_document(text_sample: str) -> dict:
@@ -57,7 +117,10 @@ Respond with JSON: {{"document_type": "...", "confidence": 0.0-1.0, "signals": [
                 temperature=0.1,
             ),
         )
-        return json.loads(response.text)
+        parsed = safe_parse_json(response.text)
+        if parsed and "document_type" in parsed:
+            return parsed
+        raise ValueError("Invalid structure returned by Gemini")
     except Exception as e:
         logger.warning(f"Gemini classification failed: {e}. Using fallback.")
         return {
@@ -114,7 +177,10 @@ bbox format: [left, top, right, bottom].""",
                 temperature=0.1,
             ),
         )
-        return json.loads(response.text)
+        parsed = safe_parse_json(response.text)
+        if parsed and ("blocks" in parsed or "full_text" in parsed):
+            return parsed
+        raise ValueError("Invalid vision OCR response structure")
     except Exception as e:
         logger.warning(f"Gemini vision OCR failed: {e}")
         return {
@@ -172,7 +238,10 @@ Respond with JSON:
                 temperature=0.1,
             ),
         )
-        return json.loads(response.text)
+        parsed = safe_parse_json(response.text)
+        if parsed and "entities" in parsed:
+            return parsed
+        raise ValueError("Invalid entities response structure")
     except Exception as e:
         logger.warning(f"Gemini entity extraction failed: {e}. Using rule-based fallback.")
         return extract_entities_rule_based(text, document_type, page_texts)
@@ -213,7 +282,10 @@ Respond with JSON:
                 temperature=0.1,
             ),
         )
-        return json.loads(response.text)
+        parsed = safe_parse_json(response.text)
+        if parsed and "tables" in parsed:
+            return parsed
+        raise ValueError("Invalid tables response structure")
     except Exception as e:
         logger.warning(f"Gemini table extraction failed: {e}. Using rule-based fallback.")
         return extract_tables_rule_based(text, document_type, page_texts)
@@ -274,7 +346,10 @@ Respond with JSON:
                 temperature=0.2,
             ),
         )
-        return json.loads(response.text)
+        parsed = safe_parse_json(response.text)
+        if parsed and any(k in parsed for k in ("timeline_events", "anomalies", "findings", "missing_information", "contradictions")):
+            return parsed
+        raise ValueError("Invalid insights response structure")
     except Exception as e:
         logger.warning(f"Gemini insight generation failed: {e}. Using rule-based fallback.")
         return generate_insights_rule_based(text, document_type, entities, page_texts)
