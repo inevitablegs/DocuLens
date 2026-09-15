@@ -26,7 +26,7 @@ for d in [DOCUMENTS_DIR, PAGES_DIR, CACHE_DIR]:
 DATABASE_URL = f"sqlite+aiosqlite:///{DB_PATH}"
 
 # ─── Gemini ──────────────────────────────────────────────
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "AIzaSyAnKClHlLkbBvebJoLaieCH0xSvQQWjN8Y")
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
 
 # ─── Processing ──────────────────────────────────────────
